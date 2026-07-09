@@ -1,15 +1,11 @@
 /**
  * @file foc_gimbal.c
- * @brief 云台应用层 — 速度环（电压模式 + Iq 前馈）
+ * @brief 云台应用层 — 位置环 + 速度环（电压模式 + Iq 前馈）
  *
- * 控制链（1 kHz 慢环）：
- *   ω_ref ──→ 速度 PI ──→ Iq_ref（限幅 ±MOTOR_IQ_MAX_A）
- *                              ↓
- *              Uq = R·Iq_ref + ω·Ke   （Ud = 0，无电流环）
- *                              ↓
- *              斜率限制 → 写入 motor->foc_var.U_qd.q
- *
- * 快环（5 kHz）读 ElAngle 并 SVPWM，Uqd 由本模块每 ms 更新。
+ * 控制链：
+ *   Pitch 目标(deg) ──→ 位置 P @200Hz ──→ ω_ref (RPM)
+ *                                              ↓
+ *   ω_ref ──→ 速度 PI @1kHz ──→ Iq_ref ──→ Uq = R·Iq + ω·Ke ──→ SVPWM
  */
 
 #include "foc_gimbal.h"
@@ -23,10 +19,39 @@
 static float    s_vq_applied;
 /** 上一拍 PI 输出的 Iq_ref（A） */
 static float    s_iq_ref;
+/** 位置环输出的 ω_ref（RPM） */
+static float    s_omega_ref;
+/** 上一拍 Pitch 反馈（deg） */
+static float    s_pitch_fb;
 /** 本模块内部预热计数（ms）；为 0 表示不额外预热 */
 static uint16_t s_loop_warmup_ms;
+/** 位置环已挂接 */
+static uint8_t  s_pos_armed;
+/** 1=Pitch 误差已在死区内（允许速度环完全停转） */
+static uint8_t  s_pos_in_deadband;
+/** TIM4 1kHz 分频，跑 200Hz 位置环 */
+static uint8_t  s_pos_div_cnt;
 
 /* -------------------------------------------------------------------------- */
+
+/** 角度 wrap 到 (-180, 180] */
+static float Gimbal_WrapDeg180(float deg)
+{
+    while (deg > 180.0f)  { deg -= 360.0f; }
+    while (deg <= -180.0f) { deg += 360.0f; }
+    return deg;
+}
+
+/** mec_deg → Pitch（相对 FOC_PITCH_ZERO_DEG，wrap ±180°） */
+float FOC_Gimbal_PitchDegFromEnc(const FOC_AS5048A_t *enc)
+{
+    float mec_deg = enc->speed.MecAngle * 360.0f / _2PI;
+
+    while (mec_deg < 0.0f)    { mec_deg += 360.0f; }
+    while (mec_deg >= 360.0f) { mec_deg -= 360.0f; }
+
+    return Gimbal_WrapDeg180(mec_deg - FOC_PITCH_ZERO_DEG);
+}
 
 /** 机械转速 RPM → 机械角速度 rad/s */
 static float Gimbal_RpmToRad(float rpm)
@@ -36,12 +61,12 @@ static float Gimbal_RpmToRad(float rpm)
 
 /**
  * @brief 电阻 + 反电势前馈：Uq = R·Iq + ω·Ke
- * @param iq_ref  速度 PI 输出的期望力矩电流 (A)
- * @param rpm_fb  反馈转速 (RPM)，用于 ω·Ke 项
+ * @param iq_ref       速度 PI 输出的 Iq_ref (A)
+ * @param rpm_for_ke   ω·Ke 项用的转速 (RPM)，推荐 target 防超调
  */
-static float Gimbal_FeedforwardVq(float iq_ref, float rpm_fb)
+static float Gimbal_FeedforwardVq(float iq_ref, float rpm_for_ke)
 {
-    float omega = Gimbal_RpmToRad(rpm_fb);
+    float omega = Gimbal_RpmToRad(rpm_for_ke);
 
     return MOTOR_R_OHM * iq_ref + omega * MOTOR_KE_VS_RAD;
 }
@@ -82,19 +107,78 @@ static void Gimbal_OutputZero(FOC_MOTOR_t *motor)
 void FOC_Gimbal_Init(FOC_MOTOR_t *motor)
 {
     motor->target_speed   = 0.0f;
+    motor->target_pitch   = 0.0f;
     motor->foc_var.U_qd.q = 0.0f;
     motor->foc_var.U_qd.d = 0.0f;
     s_vq_applied          = 0.0f;
     s_iq_ref              = 0.0f;
+    s_omega_ref           = 0.0f;
+    s_pitch_fb            = 0.0f;
     s_loop_warmup_ms      = 0u;
+    s_pos_armed           = 0u;
+    s_pos_in_deadband     = 0u;
+    s_pos_div_cnt         = 0u;
 }
 
 /**
- * @brief 速度环启动前调用：清 PID 积分、Uq 斜率、Iq 状态
- *        测试层在 RUN 预热 500 ms 结束后调用一次即可
+ * @brief 退出位置环：仅速度环测试时调用
+ */
+void FOC_Gimbal_PosDisarm(FOC_MOTOR_t *motor)
+{
+    (void)motor;
+    s_pos_armed       = 0u;
+    s_pos_in_deadband = 0u;
+    s_pos_div_cnt     = 0u;
+    s_omega_ref       = 0.0f;
+}
+
+/**
+ * @brief 位置环启动：挂速度环 + 清位置 PID，设定 Pitch 目标
+ */
+void FOC_Gimbal_PosArm(FOC_MOTOR_t *motor, float target_pitch_deg)
+{
+    FOC_Gimbal_SpeedArm(motor);
+    PID_Clear(&motor->pid_pos);
+    motor->pid_pos.P = FOC_POS_PI_P;
+    motor->pid_pos.I = FOC_POS_PI_I;
+    motor->pid_pos.D = FOC_POS_PI_D;
+    FOC_Gimbal_SetTargetPitch(motor, target_pitch_deg);
+    s_pos_armed       = 1u;
+    s_pos_in_deadband = 0u;
+    s_pos_div_cnt     = 0u;
+    s_omega_ref   = 0.0f;
+    s_pitch_fb    = FOC_Gimbal_PitchDegFromEnc(&motor->enc);
+}
+
+void FOC_Gimbal_SetTargetPitch(FOC_MOTOR_t *motor, float pitch_deg)
+{
+    motor->target_pitch = LIMIT_RANGE(pitch_deg,
+                                      -FOC_PITCH_LIMIT_DEG,
+                                      FOC_PITCH_LIMIT_DEG);
+    motor->pid_pos.SetPoint = motor->target_pitch;
+}
+
+float FOC_Gimbal_GetPitchFb(void)
+{
+    return s_pitch_fb;
+}
+
+float FOC_Gimbal_GetOmegaRef(void)
+{
+    return s_omega_ref;
+}
+
+uint8_t FOC_Gimbal_IsPosArmed(void)
+{
+    return s_pos_armed;
+}
+
+/**
+ * @brief 速度环启动前调用：清 PID 积分、Uq 斜率、Iq 状态，并退出位置环
  */
 void FOC_Gimbal_SpeedArm(FOC_MOTOR_t *motor)
 {
+    FOC_Gimbal_PosDisarm(motor);
     PID_Clear(&motor->pid_speed);
     s_vq_applied     = 0.0f;
     s_iq_ref         = 0.0f;
@@ -108,10 +192,10 @@ float FOC_Gimbal_GetIqRef(void)
     return s_iq_ref;
 }
 
-/** 调试：斜率限制后的 Uq (V) */
+/** 调试：斜率限制后的 Uq (V)，含 FOC_MOTOR_UQ_SIGN */
 float FOC_Gimbal_GetUqApplied(void)
 {
-    return s_vq_applied;
+    return FOC_MOTOR_UQ_SIGN * s_vq_applied;
 }
 
 /** 上一拍 L1：Iq 输出被 PI 限幅 */
@@ -124,6 +208,64 @@ uint8_t FOC_Gimbal_GetPiSatIqFrom(FOC_MOTOR_t *motor)
 uint8_t FOC_Gimbal_GetPiSatVqFrom(FOC_MOTOR_t *motor)
 {
     return motor->pid_speed.sat_vq;
+}
+
+/**
+ * @brief 位置环（TIM4 内 200 Hz）：Pitch P → ω_ref → target_speed
+ *
+ * 误差取最短路径 wrap；SetPoint 做等价变换使 PID 内部 Error = wrap(目标-反馈)
+ */
+void FOC_Gimbal_PosLoop(FOC_MOTOR_t *motor)
+{
+    float pitch_fb;
+    float err_wrap;
+    float sp_wrap;
+    float omega_ref;
+
+    if (!s_pos_armed)
+    {
+        return;
+    }
+
+    if (!motor->enc.angle_valid)
+    {
+        motor->target_speed   = 0.0f;
+        s_omega_ref           = 0.0f;
+        s_pos_in_deadband     = 0u;
+        return;
+    }
+
+    s_pos_div_cnt++;
+    if (s_pos_div_cnt < (uint8_t)FOC_POS_LOOP_DIV)
+    {
+        return;
+    }
+    s_pos_div_cnt = 0u;
+
+    pitch_fb       = FOC_Gimbal_PitchDegFromEnc(&motor->enc);
+    s_pitch_fb     = pitch_fb;
+    err_wrap       = Gimbal_WrapDeg180(motor->target_pitch - pitch_fb);
+    sp_wrap        = pitch_fb + err_wrap;
+    motor->pid_pos.SetPoint = sp_wrap;
+
+    omega_ref = PID_Position_ctrl(&motor->pid_pos, pitch_fb);
+    omega_ref = LIMIT_RANGE(omega_ref,
+                            -FOC_POS_OMEGA_MAX_RPM,
+                            FOC_POS_OMEGA_MAX_RPM);
+
+    /* 误差足够小：不再给速度，避免到位后抖动/停不下来 */
+    if (fabsf(err_wrap) < FOC_POS_ERR_DEADBAND_DEG)
+    {
+        omega_ref         = 0.0f;
+        s_pos_in_deadband = 1u;
+    }
+    else
+    {
+        s_pos_in_deadband = 0u;
+    }
+
+    s_omega_ref           = omega_ref;
+    motor->target_speed   = omega_ref;
 }
 
 /**
@@ -164,8 +306,17 @@ void FOC_Gimbal_SpeedLoop(FOC_MOTOR_t *motor)
 
     rpm_fb = motor->enc.speed.AvrMecSpeed;
 
-    /* 目标为 0：清积分，零力矩 */
-    if (motor->target_speed == 0.0f)
+    /* 位置环到位：误差在死区且转速足够低 → 清积分、零力矩停转 */
+    if (s_pos_armed && s_pos_in_deadband &&
+        (fabsf(rpm_fb) < FOC_POS_STOP_RPM))
+    {
+        PID_Clear(&motor->pid_speed);
+        Gimbal_OutputZero(motor);
+        return;
+    }
+
+    /* 目标为 0 且非位置环：清积分，零力矩（恒速测试停转） */
+    if ((motor->target_speed == 0.0f) && !s_pos_armed)
     {
         PID_Clear(&motor->pid_speed);
         Gimbal_OutputZero(motor);
@@ -176,8 +327,19 @@ void FOC_Gimbal_SpeedLoop(FOC_MOTOR_t *motor)
     motor->pid_speed.SetPoint = motor->target_speed;
     s_iq_ref = PID_Position_ctrl(&motor->pid_speed, rpm_fb);
 
+    /* 超调：积分在加速段积得太大，退积分太慢 → 实测超目标仍继续升 */
+    if ((rpm_fb > motor->target_speed + FOC_SPEED_OVERSHOOT_RPM) &&
+        (motor->pid_speed.I > 0.0f))
+    {
+        motor->pid_speed.SumError *= FOC_SPEED_OVERSHOOT_DECAY;
+    }
+
     /* 前馈 + Vq 限幅 + 斜率 */
-    vq_ff  = Gimbal_FeedforwardVq(s_iq_ref, rpm_fb);
+#if FOC_SPEED_FF_KE_USE_TARGET
+    vq_ff = Gimbal_FeedforwardVq(s_iq_ref, motor->target_speed);
+#else
+    vq_ff = Gimbal_FeedforwardVq(s_iq_ref, rpm_fb);
+#endif
     vq_tgt = LIMIT_RANGE(vq_ff, -VQ_MAX, VQ_MAX);
     vq     = Gimbal_SlewVq(vq_tgt);
 
@@ -196,7 +358,7 @@ void FOC_Gimbal_SpeedLoop(FOC_MOTOR_t *motor)
         s_iq_ref = motor->pid_speed.ActualValue;
     }
 
-    motor->foc_var.U_qd.q = vq;
+    motor->foc_var.U_qd.q = FOC_MOTOR_UQ_SIGN * vq;
     motor->foc_var.U_qd.d = 0.0f;
     motor->foc_var.speed  = motor->enc.speed;
 }

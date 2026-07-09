@@ -23,6 +23,7 @@ typedef struct
     uint16_t  raw;
     uint16_t  last_raw;
     uint8_t   speed_warmup;       /* 测速预热计数 */
+    uint8_t   speed_still_ms;     /* 连续静止计数 (ms) */
     bool      angle_valid;
     bool      speed_valid;
     bool      speed_init;

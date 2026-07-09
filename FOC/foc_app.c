@@ -15,9 +15,10 @@
 
 /** 全局电机实例 */
 FOC_MOTOR_t FOC_MOTOR = {
-    .pole_pairs   = MOTOR_POLE_PAIRS,
-    .power        = MOTOR_BUS_VOLTAGE,
-    .target_speed = 0.0f,
+    .pole_pairs    = MOTOR_POLE_PAIRS,
+    .power         = MOTOR_BUS_VOLTAGE,
+    .target_speed  = 0.0f,
+    .target_pitch  = 0.0f,
     .pid_speed = {
         .P                   = FOC_SPEED_PI_P,
         .I                   = FOC_SPEED_PI_I,
@@ -26,6 +27,15 @@ FOC_MOTOR_t FOC_MOTOR = {
         .ActualValue_limit   = MOTOR_IQ_MAX_A,
         .SumError_limit      = (MOTOR_IQ_MAX_A / (FOC_SPEED_PI_I * (1.0f / (float)FOC_SPEED_LOOP_HZ)) * 2.0f),
         .change_limit        = MOTOR_IQ_MAX_A,
+    },
+    .pid_pos = {
+        .P                   = FOC_POS_PI_P,
+        .I                   = FOC_POS_PI_I,
+        .D                   = FOC_POS_PI_D,
+        .SetPoint_limit      = FOC_PITCH_LIMIT_DEG,
+        .ActualValue_limit   = FOC_POS_OMEGA_MAX_RPM,
+        .SumError_limit      = 0.0f,
+        .change_limit        = FOC_POS_OMEGA_MAX_RPM,
     },
 };
 
@@ -39,6 +49,7 @@ FOC_MOTOR_t FOC_MOTOR = {
 void FOC_Init(void)
 {
     PID_Init(&FOC_MOTOR.pid_speed, (float)FOC_SPEED_LOOP_HZ);
+    PID_Init(&FOC_MOTOR.pid_pos, (float)FOC_POS_LOOP_HZ);
     FOC_AS5048A_Init(&FOC_MOTOR.enc, FOC_MOTOR.pole_pairs);
     FOC_PWM_Init(&FOC_MOTOR.pwm, FOC_PWM_PERIOD, FOC_MOTOR.power);
     FOC_Gimbal_Init(&FOC_MOTOR);

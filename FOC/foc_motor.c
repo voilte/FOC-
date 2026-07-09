@@ -269,7 +269,7 @@ void FOC_Motor_Run(FOC_MOTOR_t *motor)
 }
 
 /**
- * @brief 慢环入口（TIM4 1kHz）：测速 + 速度环
+ * @brief 慢环入口（TIM4 1kHz）：测速 + 位置环(200Hz) + 速度环
  */
 void FOC_Motor_SlowLoop(FOC_MOTOR_t *motor)
 {
@@ -278,6 +278,12 @@ void FOC_Motor_SlowLoop(FOC_MOTOR_t *motor)
         return;
     }
 
+#if (FOC_TEST_MODE == FOC_TEST_MODE_ANGLE)
+    (void)motor;
+    return;
+#endif
+
     FOC_AS5048A_Speed_Calc(&motor->enc, 1.0f / (float)FOC_SPEED_LOOP_HZ);
+    FOC_Gimbal_PosLoop(motor);
     FOC_Gimbal_SpeedLoop(motor);
 }

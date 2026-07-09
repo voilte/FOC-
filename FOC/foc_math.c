@@ -130,14 +130,12 @@ abc_t FOC_Rev_Clarke(alphabeta_t input)
  */
 float Limit_Angle(float ElAngle)
 {
-    while(ElAngle>_2PI||ElAngle<0){
-        if(ElAngle>_2PI){
-            ElAngle -= _2PI;
-        }else if(ElAngle<0){
-            ElAngle += _2PI;
-        }
+    /* fmodf：cum_count 很大时 while(ElAngle-=2π) 会在快环里卡死 MCU */
+    ElAngle = fmodf(ElAngle, _2PI);
+    if (ElAngle < 0.0f)
+    {
+        ElAngle += _2PI;
     }
-
     return ElAngle;
 }
 

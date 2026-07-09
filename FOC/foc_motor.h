@@ -33,7 +33,9 @@ typedef struct
 
     FOC_AS5048A_t   enc;
     FOC_PID_t       pid_speed;      /**< 速度环 PID（应用层配置） */
-    float           target_speed;   /**< 速度给定 (RPM)，应用层使用 */
+    FOC_PID_t       pid_pos;        /**< 位置环 PID（输出 ω_ref RPM） */
+    float           target_speed;   /**< 速度给定 (RPM)，速度环/位置环使用 */
+    float           target_pitch;   /**< Pitch 目标 (deg)，相对 FOC_PITCH_ZERO_DEG */
 
     uint32_t        calib_tick;
     uint8_t         calib_retry;

@@ -47,11 +47,47 @@ static int16_t AS5048A_DirBandCounts(void)
     return (int16_t)(FOC_ANGLE_DIR_BAND_RAD / _2PI * (float)AS5048A_RESOLUTION + 0.5f);
 }
 
-/** 由 cum_count 同步 speed.MecAngle */
+/** 由 cum_count 同步 speed.MecAngle（0～2π，供显示/Pitch 用） */
 static void AS5048A_SyncMecAngle(FOC_AS5048A_t *enc)
 {
     enc->speed.MecAngle = (float)AS5048A_CumToRaw(enc->cum_count)
                           / (float)AS5048A_RESOLUTION * _2PI;
+}
+
+/**
+ * @brief 用连续 cum_count 算电角度（FOC 用）
+ *
+ * 旧：Limit(MecAngle×pp)，MecAngle 每圈 0/2π 跳变 → ElAngle 突变 → 特定位置“卡住”
+ * 新：cum_count 连续递增 → ElAngle 在 2π 边界平滑（6.28→0 为同一点）
+ */
+static float AS5048A_ElAngleFromCum(const FOC_AS5048A_t *enc)
+{
+    float el = (float)enc->cum_count * _2PI / (float)AS5048A_RESOLUTION
+               * (float)enc->speed.pole_pairs
+               + enc->speed.PhaseShift;
+
+    return Limit_Angle(el);
+}
+
+/** cum_count 减掉整圈数，保持差分/电角不变，防 int32 膨胀与 float 精度损失 */
+static void AS5048A_WrapCumRevolutions(FOC_AS5048A_t *enc)
+{
+    const int32_t mod  = (int32_t)AS5048A_RESOLUTION;
+    const int32_t span = mod * 512;   /* 超过 ±512 圈则回绕 */
+    int32_t       strip;
+
+    if (enc->cum_count > span)
+    {
+        strip = (enc->cum_count / mod) * mod;
+        enc->cum_count      -= strip;
+        enc->speed_last_cum -= strip;
+    }
+    else if (enc->cum_count < -span)
+    {
+        strip = ((-enc->cum_count / mod) + 1) * mod;
+        enc->cum_count      += strip;
+        enc->speed_last_cum += strip;
+    }
 }
 
 /** 校验 SPI 帧：非 0/0xFFFF 且 raw 在 14-bit 范围内 */
@@ -133,6 +169,7 @@ void FOC_AS5048A_Init(FOC_AS5048A_t *enc, uint32_t pole_pairs)
     enc->speed_valid         = false;
     enc->speed_init          = false;
     enc->speed_warmup        = 0u;
+    enc->speed_still_ms      = 0u;
     enc->calib_mec_rad       = 0.0f;
 }
 
@@ -210,17 +247,14 @@ float FOC_AS5048A_Angle_Update(FOC_AS5048A_t *enc)
                 enc->cum_count += (int32_t)dr;
                 enc->last_dr    = dr;
             }
-            else
-            {
-                enc->cum_count += (int32_t)enc->last_dr;
-            }
+            /* 异常帧：丢弃，不推进 cum_count（旧逻辑 last_dr 累加会导致停转后假速度） */
         }
 
+        AS5048A_WrapCumRevolutions(enc);
         AS5048A_SyncMecAngle(enc);
     }
 
-    enc->speed.ElAngle = Limit_Angle(enc->speed.MecAngle * (float)enc->speed.pole_pairs
-                                     + enc->speed.PhaseShift);
+    enc->speed.ElAngle = AS5048A_ElAngleFromCum(enc);
     return enc->speed.ElAngle;
 }
 
@@ -233,6 +267,7 @@ void FOC_AS5048A_Speed_Reset(FOC_AS5048A_t *enc)
     enc->last_raw          = enc->raw;
     enc->last_dr           = 0;
     enc->speed_warmup      = 0u;
+    enc->speed_still_ms    = 0u;
     enc->speed_valid       = false;
     enc->speed_init        = false;
 }
@@ -248,6 +283,7 @@ void FOC_AS5048A_Speed_Reset(FOC_AS5048A_t *enc)
 void FOC_AS5048A_Speed_Calc(FOC_AS5048A_t *enc, float Ts)
 {
     int32_t dr;
+    int32_t abs_dr;
     float   rpm_inst;
     float   alpha;
 
@@ -256,7 +292,6 @@ void FOC_AS5048A_Speed_Calc(FOC_AS5048A_t *enc, float Ts)
         return;
     }
 
-    /* 预热：仅同步 cum 基准，不产生 speed_valid */
     if (enc->speed_warmup < FOC_SPEED_WARMUP_TICKS)
     {
         enc->speed_last_cum = enc->cum_count;
@@ -269,15 +304,43 @@ void FOC_AS5048A_Speed_Calc(FOC_AS5048A_t *enc, float Ts)
         enc->speed_valid = true;
     }
 
-    dr = enc->cum_count - enc->speed_last_cum;
-    enc->speed_last_cum = enc->cum_count;
+    dr     = enc->cum_count - enc->speed_last_cum;
+    abs_dr = (dr >= 0) ? dr : -dr;
 
+    /* 静止检测：cum 几乎不变 → 强制 rpm=0，快速清零 Avr */
+    if (abs_dr <= (int32_t)FOC_SPEED_ZERO_DR_COUNTS)
+    {
+        if (enc->speed_still_ms < 255u)
+        {
+            enc->speed_still_ms++;
+        }
+
+        enc->speed_last_cum = enc->cum_count;
+        rpm_inst            = 0.0f;
+
+        if (enc->speed_still_ms >= (uint8_t)FOC_SPEED_STATIC_ZERO_MS)
+        {
+            enc->speed.AvrMecSpeed = 0.0f;
+            enc->speed_init        = true;
+            return;
+        }
+    }
+    else
+    {
+        enc->speed_still_ms = 0u;
+    }
+
+    /* 坏样本：dr / rpm_inst 超限 → 丢弃本拍，不污染 Avr（旧逻辑会先推进 last_cum） */
     rpm_inst = (float)dr / (float)AS5048A_RESOLUTION / Ts * 60.0f;
 
-    if (fabsf(rpm_inst) > FOC_SPEED_INST_MAX_RPM)
+    if ((abs_dr > (int32_t)FOC_SPEED_MAX_DR_COUNTS) ||
+        (fabsf(rpm_inst) > FOC_SPEED_INST_MAX_RPM))
     {
+        enc->speed_last_cum = enc->cum_count;
         return;
     }
+
+    enc->speed_last_cum = enc->cum_count;
 
     rpm_inst = LIMIT_RANGE(rpm_inst, -FOC_SPEED_MAX_RPM, FOC_SPEED_MAX_RPM);
 
