@@ -1,0 +1,18 @@
+# Keil MDK build outputs
+MDK-ARM/FOC_bsp/
+MDK-ARM/RTE/
+MDK-ARM/build_log.txt
+MDK-ARM/EventRecorderStub.scvd
+MDK-ARM/startup_stm32f103xb.lst
+
+# Keil user-specific UI state
+*.uvguix.*
+*.uvoptx
+
+# IDE / OS
+.vscode/
+.cursor/
+*.swp
+*~
+Thumbs.db
+Desktop.ini
