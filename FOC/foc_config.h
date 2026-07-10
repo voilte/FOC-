@@ -33,6 +33,11 @@
 /* ---- 环路频率 ---- */
 #define FOC_PWM_FREQ_HZ         10000u
 #define FOC_SPEED_LOOP_HZ       1000u
+/* 快环 SPI 分频：每 N 次 SVPWM 才读一次 AS5048A（N=1 每拍读；2→约 2.5kHz，显著降 CPU） */
+#define FOC_ENC_READ_DIV        2u
+#if (FOC_ENC_READ_DIV < 1u)
+#error FOC_ENC_READ_DIV must be >= 1
+#endif
 
 /* ---- 电压限幅 ---- */
 #define VQ_MAX                  (MOTOR_BUS_VOLTAGE * 0.85f)
@@ -73,21 +78,26 @@
 #define FOC_TEST_MODE_SPEED         0
 #define FOC_TEST_MODE_ANGLE         1
 #define FOC_TEST_MODE_POSITION      2
-#define FOC_TEST_MODE               FOC_TEST_MODE_SPEED
+#define FOC_TEST_MODE               FOC_TEST_MODE_POSITION
 
 /* 兼容旧宏名 */
 #define FOC_TEST_MODE_ANGLE_ONLY    (FOC_TEST_MODE == FOC_TEST_MODE_ANGLE)
 
 /* ---- 测速 / 速度环测试（FOC_TEST_MODE_SPEED） ---- */
-#define FOC_TEST_TARGET_RPM         30.0f   /* FOC_TEST_SPEED_STEP_ENABLE=0 时恒速给定 */
-#define FOC_TEST_SPEED_STEP_ENABLE  1       /* 1=阶梯给定  0=恒速 */
+#define FOC_TEST_TARGET_RPM         (-20.0f) /* 负转速方向验证；正转 OK 后改回位置环 */
+#define FOC_TEST_SPEED_STEP_ENABLE  0       /* 1=阶梯给定  0=恒速 */
 #define FOC_TEST_SPEED_STEP_MIN_RPM 20.0f   /* 阶梯起始 RPM */
 #define FOC_TEST_SPEED_STEP_MAX_RPM 40.0f   /* 阶梯结束 RPM */
 #define FOC_TEST_SPEED_STEP_DELTA   1.0f    /* 每级递增 RPM */
 #define FOC_TEST_SPEED_STEP_HOLD_MS 3000u   /* 每级保持时间 (ms) */
 
 /* ---- 位置环测试（FOC_TEST_MODE_POSITION） ---- */
-#define FOC_TEST_TARGET_PITCH_DEG   0.0f    /* Pitch 目标角 (deg)，相对水平零点 */
+#define FOC_TEST_TARGET_PITCH_DEG   0.0f    /* RAMP_ENABLE=0 时恒角给定 */
+#define FOC_TEST_POS_RAMP_ENABLE      1       /* 1=线性斜坡  0=恒角 */
+#define FOC_TEST_POS_RAMP_MIN_DEG    -15.0f   /* 斜坡起点 (deg) */
+#define FOC_TEST_POS_RAMP_MAX_DEG     15.0f   /* 斜坡终点 (deg) */
+#define FOC_TEST_POS_RAMP_RATE_DPS     3.0f   /* 斜坡速率 (°/s)，全行程约 30 s */
+#define FOC_TEST_POS_RAMP_UPDATE_MS    20u    /* 斜坡目标更新间隔，勿绑 FOC_POS_LOOP_HZ */
 
 /* ---- Vd-lock 校准（仅 OTP 未烧且未模拟时 boot 使用；OTP 方案下不启用） ---- */
 #define FOC_CALIB_VD                1.5f
@@ -104,19 +114,25 @@
 #define FOC_PITCH_ZERO_DEG          182.0f
 #define FOC_PITCH_LIMIT_DEG         60.0f   /* 软限位 ±60° */
 
-/* ---- 位置环 P → ω_ref（200 Hz，TIM4 5 分频） ----
- * 输出 RPM 给速度环；P 单位 RPM/deg，初值需实机微调 */
-#define FOC_POS_LOOP_HZ             200u
+#define FOC_POS_TARGET_JUMP_DEG     5.0f    /* 目标变化超此值才清速度积分（斜坡勿用 0.5） */
+
+/* ---- 位置环 P → ω_ref（推荐 200~250 Hz；速度环仍 1 kHz） ----
+ * 外环再高对云台收益很小，TIM4 负担略增；真正吃 CPU 的是 TIM2 快环 SPI+SVPWM
+ * 输出 RPM 给速度环；P 单位 RPM/deg */
+#define FOC_POS_LOOP_HZ             250u
 #define FOC_POS_LOOP_DIV            (FOC_SPEED_LOOP_HZ / FOC_POS_LOOP_HZ)
 #if (FOC_POS_LOOP_DIV * FOC_POS_LOOP_HZ) != FOC_SPEED_LOOP_HZ
 #error FOC_POS_LOOP_HZ must divide FOC_SPEED_LOOP_HZ evenly
 #endif
-#define FOC_POS_PI_P                0.02f    /* 位置环 P：RPM/deg，增大=响应快、易振荡 */
-#define FOC_POS_PI_I                0.0f    /* 位置环 I：暂为 0，消除静差时可试 0.01~0.05 */
-#define FOC_POS_PI_D                0.0f    /* 位置环 D：暂为 0 */
-#define FOC_POS_OMEGA_MAX_RPM       30.0f   /* 位置环输出 ω_ref 限幅 (RPM)，先保守 */
-#define FOC_POS_ERR_DEADBAND_DEG    1.5f    /* |Pitch 误差| < 此值 → ω_ref=0，防抖动 */
-#define FOC_POS_STOP_RPM            3.0f    /* 到位：误差在死区内且 |rpm| < 此值 → 完全停转 */
+#define FOC_POS_PI_P                5.5f
+#define FOC_POS_PI_I                0.00f
+#define FOC_POS_PI_D                0.0f
+#define FOC_POS_OMEGA_MAX_RPM       30.0f
+#define FOC_POS_OMEGA_MIN_RPM       12.0f   /* 仅 |误差|>MIN_OMEGA_ERR 时生效 */
+#define FOC_POS_MIN_OMEGA_ERR_DEG   2.0f
+#define FOC_POS_OMEGA_FINE_RPM      5.0f
+#define FOC_POS_ERR_DEADBAND_DEG    0.3f
+#define FOC_POS_STOP_RPM            2.0f
 
 /* ---- 角度跟踪 ---- */
 #define FOC_ANGLE_GLITCH_MAX_RAD  0.006f
@@ -126,6 +142,7 @@
 /* ---- 测速验证测试（foc_test.c） ---- */
 #define FOC_TEST_READY_DELAY_MS     1000u
 #define FOC_TEST_RUN_WARMUP_MS      500u
-#define FOC_TEST_PRINT_MS           50u
+#define FOC_TEST_PRINT_MS           50u     /* 速度环 VOFA 间隔 */
+#define FOC_TEST_POS_PRINT_MS       100u    /* 位置环 VOFA 间隔（减轻串口） */
 
 #endif /* FOC_CONFIG_H */

@@ -83,13 +83,33 @@ void FOC_Motor_StartGimbal(FOC_MOTOR_t *motor)
     }
 }
 
+#if (FOC_ENC_READ_DIV > 1u)
+static uint8_t s_enc_read_cnt;
+static float   s_el_angle_cached;
+#endif
+
 /**
  * @brief FOC 快环（TIM2 ~5kHz）
  *        读 AS5048A 机械角 → 电角度 → 逆 Park + SVPWM
  */
 void Motor_Gimbal_Voltage_RUN(FOC_MOTOR_t *motor)
 {
-    float ElAngle = FOC_AS5048A_Angle_Update(&motor->enc);
+    float ElAngle;
+
+#if (FOC_ENC_READ_DIV > 1u)
+    if (s_enc_read_cnt == 0u)
+    {
+        s_el_angle_cached = FOC_AS5048A_Angle_Update(&motor->enc);
+    }
+    s_enc_read_cnt++;
+    if (s_enc_read_cnt >= (uint8_t)FOC_ENC_READ_DIV)
+    {
+        s_enc_read_cnt = 0u;
+    }
+    ElAngle = s_el_angle_cached;
+#else
+    ElAngle = FOC_AS5048A_Angle_Update(&motor->enc);
+#endif
 
     FOC_PWM_Run(&motor->pwm, motor->foc_var.U_qd, ElAngle);
     motor->foc_var.speed = motor->enc.speed;

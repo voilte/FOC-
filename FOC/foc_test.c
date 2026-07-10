@@ -10,7 +10,7 @@
 
  * FOC_TEST_MODE_ANGLE：只读机械角
 
- * FOC_TEST_MODE_POSITION：位置环 + 速度环
+ * FOC_TEST_MODE_POSITION：位置环 + 速度环（可选 Pitch 线性斜坡）
 
  */
 
@@ -37,7 +37,6 @@
 
 
 #include <stdio.h>
-
 #include <stdarg.h>
 
 
@@ -87,8 +86,15 @@ static uint8_t         s_started_run;
 #if (FOC_TEST_MODE == FOC_TEST_MODE_SPEED) && FOC_TEST_SPEED_STEP_ENABLE
 
 static float     s_step_target_rpm;
-
 static uint32_t  s_step_since_ms;
+
+#endif
+
+#if (FOC_TEST_MODE == FOC_TEST_MODE_POSITION) && FOC_TEST_POS_RAMP_ENABLE
+
+static float     s_ramp_pitch;
+static uint32_t  s_ramp_last_ms;
+static int8_t    s_ramp_dir;
 
 #endif
 
@@ -151,14 +157,19 @@ static void Test_PrintBanner(void)
                     FOC_PITCH_LIMIT_DEG);
 
     FOC_Test_Printf("Pos PID  P=%.2f I=%.4f  w_max=%.0f RPM\r\n",
-
                     FOC_POS_PI_P,
-
                     FOC_POS_PI_I,
-
                     FOC_POS_OMEGA_MAX_RPM);
-
-    FOC_Test_Printf("VOFA: mec_deg  pitch_fb  pos  spd\r\n\r\n");
+#if FOC_TEST_POS_RAMP_ENABLE
+    FOC_Test_Printf("Ramp pitch: %.0f -> %.0f deg @ %.1f deg/s (ping-pong)\r\n",
+                    FOC_TEST_POS_RAMP_MIN_DEG,
+                    FOC_TEST_POS_RAMP_MAX_DEG,
+                    FOC_TEST_POS_RAMP_RATE_DPS);
+#else
+    FOC_Test_Printf("Const pitch target: %.1f deg\r\n", FOC_TEST_TARGET_PITCH_DEG);
+#endif
+    FOC_Test_Printf("VOFA 2ch @ %u ms: I0=tgt  I1=pitch_fb\r\n\r\n",
+                    (unsigned)FOC_TEST_POS_PRINT_MS);
 
 #else
 
@@ -439,6 +450,56 @@ static void Test_PrintSpeedLoop(void)
 
 
 
+static void Test_ApplyPitchTarget(float pitch_deg)
+{
+    FOC_Gimbal_SetTargetPitch(&FOC_MOTOR, pitch_deg);
+}
+
+#if FOC_TEST_POS_RAMP_ENABLE
+
+static void Test_RampPitchInit(void)
+{
+    s_ramp_pitch     = FOC_TEST_POS_RAMP_MIN_DEG;
+    s_ramp_last_ms   = HAL_GetTick();
+    s_ramp_dir       = 1;
+    Test_ApplyPitchTarget(s_ramp_pitch);
+}
+
+/** 线性斜坡（main 轮询，FOC_TEST_POS_RAMP_UPDATE_MS 更新目标，与位置环频率无关） */
+static void Test_RampPitchPoll(void)
+{
+    uint32_t now = HAL_GetTick();
+    uint32_t dt_ms;
+    float    dt_s;
+    float    delta;
+
+    dt_ms = now - s_ramp_last_ms;
+    if (dt_ms < (uint32_t)FOC_TEST_POS_RAMP_UPDATE_MS)
+    {
+        return;
+    }
+
+    s_ramp_last_ms = now;
+    dt_s           = (float)dt_ms * 0.001f;
+    delta          = FOC_TEST_POS_RAMP_RATE_DPS * dt_s * (float)s_ramp_dir;
+    s_ramp_pitch  += delta;
+
+    if (s_ramp_pitch >= FOC_TEST_POS_RAMP_MAX_DEG)
+    {
+        s_ramp_pitch = FOC_TEST_POS_RAMP_MAX_DEG;
+        s_ramp_dir   = -1;
+    }
+    else if (s_ramp_pitch <= FOC_TEST_POS_RAMP_MIN_DEG)
+    {
+        s_ramp_pitch = FOC_TEST_POS_RAMP_MIN_DEG;
+        s_ramp_dir   = 1;
+    }
+
+    Test_ApplyPitchTarget(s_ramp_pitch);
+}
+
+#endif /* FOC_TEST_POS_RAMP_ENABLE */
+
 static void Test_ArmPositionLoop(void)
 
 {
@@ -449,11 +510,16 @@ static void Test_ArmPositionLoop(void)
 
     FOC_MOTOR.pid_speed.I = FOC_SPEED_PI_I;
 
-
-
+#if FOC_TEST_POS_RAMP_ENABLE
+    Test_RampPitchInit();
+    FOC_Test_Printf("[TEST] Position loop ON  ramp %.0f->%.0f @ %.1f deg/s\r\n",
+                    FOC_TEST_POS_RAMP_MIN_DEG,
+                    FOC_TEST_POS_RAMP_MAX_DEG,
+                    FOC_TEST_POS_RAMP_RATE_DPS);
+#else
     FOC_Test_Printf("[TEST] Position loop ON  pitch tgt=%.1f deg\r\n",
-
                     FOC_MOTOR.target_pitch);
+#endif
 
 }
 
@@ -463,41 +529,10 @@ static void Test_PrintPositionLoop(void)
 
 {
 
-    const FOC_AS5048A_t *enc = &FOC_MOTOR.enc;
+    float pitch_fb = FOC_Gimbal_GetPitchFb();
+    float tgt      = FOC_MOTOR.target_pitch;
 
-    float mec_deg  = Test_MecDeg360(enc);
-
-    float pitch_fb = FOC_Gimbal_PitchDegFromEnc(enc);
-
-    float err      = FOC_MOTOR.target_pitch - pitch_fb;
-
-
-
-    while (err > 180.0f)  { err -= 360.0f; }
-
-    while (err <= -180.0f) { err += 360.0f; }
-
-
-
-    FOC_Test_Printf("mec_deg:%.2f\n", mec_deg);
-
-    FOC_Test_Printf("pitch_fb:%.2f\n", pitch_fb);
-
-    FOC_Test_Printf("pos:%.2f,%.2f,%.2f,%.2f\n",
-
-                    FOC_MOTOR.target_pitch,
-
-                    pitch_fb,
-
-                    err,
-
-                    FOC_Gimbal_GetOmegaRef());
-
-    FOC_Test_Printf("speed:%.2f,%.2f\n",
-
-                    FOC_MOTOR.target_speed,
-
-                    enc->speed.AvrMecSpeed);
+    FOC_Test_Printf("%.2f,%.2f\n", tgt, pitch_fb);
 
 }
 
@@ -637,23 +672,16 @@ void FOC_Test_Poll(void)
 
             }
 
-            else if ((now - s_last_print_ms) >= (uint32_t)FOC_TEST_PRINT_MS)
-
-            {
-
-                s_last_print_ms = now;
-
-                Test_PrintMecAndPitchFb();
-
-            }
-
             break;
 
 
 
         case TEST_POS_LOOP:
 
-            if ((now - s_last_print_ms) >= (uint32_t)FOC_TEST_PRINT_MS)
+#if FOC_TEST_POS_RAMP_ENABLE
+            Test_RampPitchPoll();
+#endif
+            if ((now - s_last_print_ms) >= (uint32_t)FOC_TEST_POS_PRINT_MS)
 
             {
 

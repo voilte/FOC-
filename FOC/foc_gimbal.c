@@ -29,7 +29,7 @@ static uint16_t s_loop_warmup_ms;
 static uint8_t  s_pos_armed;
 /** 1=Pitch 误差已在死区内（允许速度环完全停转） */
 static uint8_t  s_pos_in_deadband;
-/** TIM4 1kHz 分频，跑 200Hz 位置环 */
+/** TIM4 1kHz 分频，跑位置环 */
 static uint8_t  s_pos_div_cnt;
 
 /* -------------------------------------------------------------------------- */
@@ -152,10 +152,20 @@ void FOC_Gimbal_PosArm(FOC_MOTOR_t *motor, float target_pitch_deg)
 
 void FOC_Gimbal_SetTargetPitch(FOC_MOTOR_t *motor, float pitch_deg)
 {
+    float old_tgt = motor->target_pitch;
+
     motor->target_pitch = LIMIT_RANGE(pitch_deg,
                                       -FOC_PITCH_LIMIT_DEG,
                                       FOC_PITCH_LIMIT_DEG);
     motor->pid_pos.SetPoint = motor->target_pitch;
+
+    /* 仅大阶跃清速度积分；连续斜坡每 0.5° 清一次会导致内环永远积不上 */
+    if (s_pos_armed &&
+        (fabsf(motor->target_pitch - old_tgt) > FOC_POS_TARGET_JUMP_DEG))
+    {
+        s_pos_in_deadband = 0u;
+        PID_Clear(&motor->pid_speed);
+    }
 }
 
 float FOC_Gimbal_GetPitchFb(void)
@@ -211,7 +221,7 @@ uint8_t FOC_Gimbal_GetPiSatVqFrom(FOC_MOTOR_t *motor)
 }
 
 /**
- * @brief 位置环（TIM4 内 200 Hz）：Pitch P → ω_ref → target_speed
+ * @brief 位置环（TIM4 1 kHz）：Pitch P → ω_ref → target_speed
  *
  * 误差取最短路径 wrap；SetPoint 做等价变换使 PID 内部 Error = wrap(目标-反馈)
  */
@@ -238,6 +248,7 @@ void FOC_Gimbal_PosLoop(FOC_MOTOR_t *motor)
     s_pos_div_cnt++;
     if (s_pos_div_cnt < (uint8_t)FOC_POS_LOOP_DIV)
     {
+        motor->target_speed = s_omega_ref;
         return;
     }
     s_pos_div_cnt = 0u;
@@ -253,15 +264,37 @@ void FOC_Gimbal_PosLoop(FOC_MOTOR_t *motor)
                             -FOC_POS_OMEGA_MAX_RPM,
                             FOC_POS_OMEGA_MAX_RPM);
 
-    /* 误差足够小：不再给速度，避免到位后抖动/停不下来 */
+    /* 死区：纯 P 时直接停；有 I 时允许低速精调 */
     if (fabsf(err_wrap) < FOC_POS_ERR_DEADBAND_DEG)
     {
-        omega_ref         = 0.0f;
         s_pos_in_deadband = 1u;
+
+        if (motor->pid_pos.I > 0.0f)
+        {
+            omega_ref = LIMIT_RANGE(omega_ref,
+                                    -FOC_POS_OMEGA_FINE_RPM,
+                                    FOC_POS_OMEGA_FINE_RPM);
+            if (fabsf(omega_ref) < 0.3f)
+            {
+                omega_ref = 0.0f;
+            }
+        }
+        else
+        {
+            omega_ref = 0.0f;
+        }
     }
     else
     {
         s_pos_in_deadband = 0u;
+
+        if ((FOC_POS_OMEGA_MIN_RPM > 0.0f) &&
+            (fabsf(err_wrap) > FOC_POS_MIN_OMEGA_ERR_DEG) &&
+            (fabsf(omega_ref) < FOC_POS_OMEGA_MIN_RPM))
+        {
+            omega_ref = (err_wrap > 0.0f) ? FOC_POS_OMEGA_MIN_RPM
+                                          : -FOC_POS_OMEGA_MIN_RPM;
+        }
     }
 
     s_omega_ref           = omega_ref;
@@ -306,9 +339,10 @@ void FOC_Gimbal_SpeedLoop(FOC_MOTOR_t *motor)
 
     rpm_fb = motor->enc.speed.AvrMecSpeed;
 
-    /* 位置环到位：误差在死区且转速足够低 → 清积分、零力矩停转 */
+    /* 到位停力：仅 ω_ref≈0 时；死区内 I 精调仍允许非零 target_speed */
     if (s_pos_armed && s_pos_in_deadband &&
-        (fabsf(rpm_fb) < FOC_POS_STOP_RPM))
+        (fabsf(rpm_fb) < FOC_POS_STOP_RPM) &&
+        (fabsf(motor->target_speed) < 0.5f))
     {
         PID_Clear(&motor->pid_speed);
         Gimbal_OutputZero(motor);
@@ -327,16 +361,34 @@ void FOC_Gimbal_SpeedLoop(FOC_MOTOR_t *motor)
     motor->pid_speed.SetPoint = motor->target_speed;
     s_iq_ref = PID_Position_ctrl(&motor->pid_speed, rpm_fb);
 
-    /* 超调：积分在加速段积得太大，退积分太慢 → 实测超目标仍继续升 */
-    if ((rpm_fb > motor->target_speed + FOC_SPEED_OVERSHOOT_RPM) &&
-        (motor->pid_speed.I > 0.0f))
+    /* 超调退积分：仅恒速测试；位置环负速目标时 rpm=0 会误判为超调 */
+    if (!s_pos_armed)
     {
-        motor->pid_speed.SumError *= FOC_SPEED_OVERSHOOT_DECAY;
+        float spd_overshoot = rpm_fb - motor->target_speed;
+
+        if ((spd_overshoot > FOC_SPEED_OVERSHOOT_RPM) &&
+            (motor->pid_speed.I > 0.0f))
+        {
+            motor->pid_speed.SumError *= FOC_SPEED_OVERSHOOT_DECAY;
+        }
+        else if ((spd_overshoot < -FOC_SPEED_OVERSHOOT_RPM) &&
+                 (motor->pid_speed.I < 0.0f))
+        {
+            motor->pid_speed.SumError *= FOC_SPEED_OVERSHOOT_DECAY;
+        }
     }
 
-    /* 前馈 + Vq 限幅 + 斜率 */
+    /* 前馈 + Vq 限幅 + 斜率
+     * 位置环：Ke 用 rpm_fb（静止时 Ke≈0）；恒速测试仍可用 target 防超调 */
 #if FOC_SPEED_FF_KE_USE_TARGET
-    vq_ff = Gimbal_FeedforwardVq(s_iq_ref, motor->target_speed);
+    if (s_pos_armed)
+    {
+        vq_ff = Gimbal_FeedforwardVq(s_iq_ref, rpm_fb);
+    }
+    else
+    {
+        vq_ff = Gimbal_FeedforwardVq(s_iq_ref, motor->target_speed);
+    }
 #else
     vq_ff = Gimbal_FeedforwardVq(s_iq_ref, rpm_fb);
 #endif

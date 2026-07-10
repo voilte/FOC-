@@ -109,6 +109,7 @@ int main(void)
 
     /* USER CODE BEGIN 3 */
     FOC_Test_Poll();
+    __WFI();   /* 无任务时休眠，等 TIM/SysTick 唤醒；降主循环空转发热 */
     /* USER CODE END 3 */
   }
   /* USER CODE END 3 */

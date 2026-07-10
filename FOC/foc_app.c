@@ -34,7 +34,11 @@ FOC_MOTOR_t FOC_MOTOR = {
         .D                   = FOC_POS_PI_D,
         .SetPoint_limit      = FOC_PITCH_LIMIT_DEG,
         .ActualValue_limit   = FOC_POS_OMEGA_MAX_RPM,
-        .SumError_limit      = 0.0f,
+        .SumError_limit      = (FOC_POS_PI_I > 0.0f)
+                                 ? (FOC_POS_OMEGA_MAX_RPM
+                                    / (FOC_POS_PI_I * (1.0f / (float)FOC_POS_LOOP_HZ))
+                                    * 2.0f)
+                                 : 0.0f,
         .change_limit        = FOC_POS_OMEGA_MAX_RPM,
     },
 };
